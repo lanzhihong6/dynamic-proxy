@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -54,6 +55,13 @@ var (
 	// Each goroutine gets its own Searcher instance from the pool
 	searcherV4Pool *sync.Pool
 	searcherV6Pool *sync.Pool
+
+	// Global proxy pools - accessed from admin endpoints
+	strictPool  *ProxyPool
+	relaxedPool *ProxyPool
+
+	// Track last successful update time
+	lastUpdateTime atomic.Value // stores time.Time
 )
 
 type ProxyPool struct {
@@ -97,6 +105,25 @@ func (p *ProxyPool) GetNext(session, country string) (string, error) {
 		idx = atomic.AddUint64(&p.index, 1) % uint64(len(cands))
 	}
 	return cands[idx].Addr, nil
+}
+
+// GetStats returns thread-safe statistics about the proxy pool
+func (p *ProxyPool) GetStats() map[string]int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	
+	stats := make(map[string]int)
+	for _, proxy := range p.proxies {
+		stats[proxy.Country]++
+	}
+	return stats
+}
+
+// GetTotalCount returns the total number of proxies in the pool
+func (p *ProxyPool) GetTotalCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.proxies)
 }
 
 func fetchProxyList() []string {
@@ -390,7 +417,32 @@ func updatePools(sp, rp *ProxyPool) {
 	wg.Wait()
 	sp.Update(s)
 	rp.Update(r)
+	
+	// Update last update time
+	lastUpdateTime.Store(time.Now())
+	
+	// Enhanced summary logging
+	strictStats := sp.GetStats()
+	relaxedStats := rp.GetStats()
+	
 	log.Printf("[UPDATE] Complete. Strict: %d, Relaxed: %d", len(s), len(r))
+	
+	// Format detailed country distribution for major countries
+	majorCountries := []string{"KR", "US", "JP", "CN", "HK"}
+	var strictSummary, relaxedSummary []string
+	
+	for _, country := range majorCountries {
+		if count := strictStats[country]; count > 0 {
+			strictSummary = append(strictSummary, fmt.Sprintf("%s:%d", country, count))
+		}
+		if count := relaxedStats[country]; count > 0 {
+			relaxedSummary = append(relaxedSummary, fmt.Sprintf("%s:%d", country, count))
+		}
+	}
+	
+	log.Printf("[UPDATE] Summary - Strict [%s], Relaxed [%s]", 
+		strings.Join(strictSummary, ", "), 
+		strings.Join(relaxedSummary, ", "))
 }
 
 func handleHTTP(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
@@ -444,6 +496,67 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode st
 	io.Copy(w, resp.Body)
 }
 
+// Admin endpoint handlers
+
+type PoolStatus struct {
+	Total     int            `json:"total"`
+	Countries map[string]int `json:"countries"`
+}
+
+type StatusResponse struct {
+	Strict         PoolStatus `json:"strict"`
+	Relaxed        PoolStatus `json:"relaxed"`
+	LastUpdateTime string     `json:"last_update_time"`
+}
+
+func handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	strictStats := strictPool.GetStats()
+	relaxedStats := relaxedPool.GetStats()
+	
+	var lastUpdate string
+	if t, ok := lastUpdateTime.Load().(time.Time); ok {
+		lastUpdate = t.Format(time.RFC3339)
+	} else {
+		lastUpdate = "never"
+	}
+
+	response := StatusResponse{
+		Strict: PoolStatus{
+			Total:     strictPool.GetTotalCount(),
+			Countries: strictStats,
+		},
+		Relaxed: PoolStatus{
+			Total:     relaxedPool.GetTotalCount(),
+			Countries: relaxedStats,
+		},
+		LastUpdateTime: lastUpdate,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Trigger update asynchronously
+	go updatePools(strictPool, relaxedPool)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "triggered",
+		"message": "Proxy pool update has been triggered",
+	})
+}
+
 func main() {
 	cfgFile, err := os.ReadFile("config.yaml")
 	if err == nil {
@@ -495,21 +608,31 @@ func main() {
 	initSearcherPools()
 	log.Println("[BOOT] Searcher pools initialized")
 
-	sp, rp := &ProxyPool{}, &ProxyPool{}
+	strictPool = &ProxyPool{}
+	relaxedPool = &ProxyPool{}
+	
 	log.Println("[BOOT] Initial health check starting...")
-	updatePools(sp, rp)
+	updatePools(strictPool, relaxedPool)
 
 	go func() {
 		for {
 			time.Sleep(time.Duration(config.UpdateIntervalMinutes) * time.Minute)
-			updatePools(sp, rp)
+			updatePools(strictPool, relaxedPool)
 		}
 	}()
 
-	hS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, sp, "STRICT") })
-	hR := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, rp, "RELAXED") })
+	hS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, strictPool, "STRICT") })
+	hR := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, relaxedPool, "RELAXED") })
 
-	log.Printf("[BOOT] Servers on %s and %s", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
+	// Admin interface on :17288
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/status", handleAdminStatus)
+	adminMux.HandleFunc("/update", handleAdminUpdate)
+
+	log.Printf("[BOOT] Proxy servers on %s (strict) and %s (relaxed)", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
+	log.Println("[BOOT] Admin interface on :17288")
+	
+	go http.ListenAndServe(":17288", adminMux)
 	go http.ListenAndServe(config.Ports.HTTPStrict, hS)
 	http.ListenAndServe(config.Ports.HTTPRelaxed, hR)
 }
