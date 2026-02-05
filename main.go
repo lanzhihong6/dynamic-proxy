@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -45,14 +44,16 @@ type ProxyInfo struct {
 	Country string
 }
 
-var config Config
-var simpleProxyRegex = regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
+var (
+	config           Config
+	simpleProxyRegex = regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
+)
 
 func loadConfig(filename string) (*Config, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil { return nil, err }
 	var cfg Config
-	yaml.Unmarshal(data, &cfg)
+	if err := yaml.Unmarshal(data, &cfg); err != nil { return nil, err }
 	if cfg.HealthCheckConcurrency <= 0 { cfg.HealthCheckConcurrency = 200 }
 	if cfg.UpdateIntervalMinutes <= 0 { cfg.UpdateIntervalMinutes = 5 }
 	if cfg.HealthCheck.TotalTimeoutSeconds <= 0 { cfg.HealthCheck.TotalTimeoutSeconds = 8 }
@@ -73,13 +74,13 @@ func (p *ProxyPool) Update(proxies []ProxyInfo) {
 	defer p.mu.Unlock()
 	p.proxies = proxies
 	atomic.StoreUint64(&p.index, 0)
-	log.Printf("[POOL] Updated: %d active proxies", len(proxies))
+	log.Printf("[POOL] Updated with %d healthy proxies", len(proxies))
 }
 
 func (p *ProxyPool) GetNext(session, country string) (string, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if len(p.proxies) == 0 { return "", fmt.Errorf("no proxies") }
+	if len(p.proxies) == 0 { return "", fmt.Errorf("no proxies available") }
 	var cands []ProxyInfo
 	if country != "" {
 		for _, pr := range p.proxies {
@@ -89,9 +90,10 @@ func (p *ProxyPool) GetNext(session, country string) (string, error) {
 	} else {
 		cands = p.proxies
 	}
-	idx := uint64(0)
+	var idx uint64
 	if session != "" {
-		h := fnv.New32a(); h.Write([]byte(session))
+		h := fnv.New32a()
+		h.Write([]byte(session))
 		idx = uint64(h.Sum32()) % uint64(len(cands))
 	} else {
 		idx = atomic.AddUint64(&p.index, 1) % uint64(len(cands))
@@ -100,13 +102,14 @@ func (p *ProxyPool) GetNext(session, country string) (string, error) {
 }
 
 func fetchProxyList() []string {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second}
 	var list []string
 	set := make(map[string]bool)
 	for _, url := range append(config.ProxyListURLs, config.SpecialProxyListUrls...) {
 		resp, err := client.Get(url)
 		if err != nil { continue }
-		b, _ := io.ReadAll(resp.Body); resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		matches := simpleProxyRegex.FindAllString(string(b), -1)
 		for _, m := range matches {
 			if !set[m] { set[m] = true; list = append(list, m) }
@@ -130,7 +133,7 @@ func check(addr string, strict bool) (bool, string) {
 	if err != nil { return false, "" }
 	defer resp.Body.Close()
 	var g struct { Status, CountryCode string }
-	json.NewDecoder(resp.Body).Decode(&g)
+	if err := json.NewDecoder(resp.Body).Decode(&g); err != nil { return true, "XX" }
 	if g.Status == "success" { return true, g.CountryCode }
 	return true, "XX"
 }
@@ -146,7 +149,7 @@ func update(sp, rp *ProxyPool) {
 	for _, a := range list {
 		wg.Add(1)
 		go func(addr string) {
-			defer wg.Done(); sem <- struct{}{}; defer func(){<-sem}()
+			defer wg.Done(); sem <- struct{}{}; defer func(){ <-sem }()
 			if ok, c := check(addr, true); ok {
 				mu.Lock(); info := ProxyInfo{addr, c}; s = append(s, info); r = append(r, info); mu.Unlock()
 			} else if ok, c := check(addr, false); ok {
@@ -164,32 +167,27 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode st
 	proxyAddr, err := pool.GetNext(session, country)
 	if err != nil { http.Error(w, err.Error(), 503); return }
 
-	dialer, _ := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil { http.Error(w, "Dialer error", 500); return }
 
-	// Handle HTTPS via CONNECT or direct URL
 	if r.Method == http.MethodConnect || r.URL.Scheme == "https" {
 		target := r.Host
 		if target == "" { target = r.URL.Host }
-		log.Printf("[%s] Tunnel: %s via %s", mode, target, proxyAddr)
 		dest, err := dialer.Dial("tcp", target)
 		if err != nil { http.Error(w, err.Error(), 502); return }
 		defer dest.Close()
-		
-		hijacker, _ := w.(http.Hijacker)
+		hijacker, ok := w.(http.Hijacker)
+		if !ok { http.Error(w, "Hijack error", 500); return }
 		conn, _, _ := hijacker.Hijack()
 		defer conn.Close()
-		
 		if r.Method == http.MethodConnect {
 			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		}
-		
 		go io.Copy(dest, conn)
 		io.Copy(conn, dest)
 		return
 	}
 
-	// Normal HTTP
-	log.Printf("[%s] Proxy: %s via %s", mode, r.URL.String(), proxyAddr)
 	transport := &http.Transport{Dial: dialer.Dial}
 	resp, err := transport.RoundTrip(r)
 	if err != nil { http.Error(w, err.Error(), 502); return }
@@ -200,14 +198,19 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode st
 }
 
 func main() {
-	cfg, _ := loadConfig("config.yaml"); config = *cfg
+	cfg, err := loadConfig("config.yaml")
+	if err != nil { log.Fatalf("Config failed: %v", err) }
+	config = *cfg
 	sp, rp := &ProxyPool{}, &ProxyPool{}
 	go func() {
-		for { update(sp, rp); time.Sleep(time.Duration(config.UpdateIntervalMinutes) * time.Minute) }
+		for {
+			update(sp, rp)
+			time.Sleep(time.Duration(config.UpdateIntervalMinutes) * time.Minute)
+		}
 	}()
 	hS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, sp, "STRICT") })
 	hR := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, rp, "RELAXED") })
+	log.Printf("Starting servers on %s and %s", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
 	go http.ListenAndServe(config.Ports.HTTPStrict, hS)
-	log.Printf("Servers started on %s, %s", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
 	http.ListenAndServe(config.Ports.HTTPRelaxed, hR)
 }
