@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,7 +69,7 @@ type ProxyPool struct {
 	proxies  []ProxyInfo
 	mu       sync.RWMutex
 	index    uint64
-	updating int32
+	updating int32 // Use atomic.LoadInt32/StoreInt32/CompareAndSwapInt32
 }
 
 func (p *ProxyPool) Update(proxies []ProxyInfo) {
@@ -377,10 +378,16 @@ func check(addr string, strict bool) (bool, string) {
 }
 
 func updatePools(sp, rp *ProxyPool) {
+	// CRITICAL FIX: Check and lock BOTH pools atomically
+	// Use sp.updating as the global lock since both pools are always updated together
 	if !atomic.CompareAndSwapInt32(&sp.updating, 0, 1) {
 		return
 	}
 	defer atomic.StoreInt32(&sp.updating, 0)
+	
+	// Mark relaxed pool as updating too (for accurate status reporting)
+	atomic.StoreInt32(&rp.updating, 1)
+	defer atomic.StoreInt32(&rp.updating, 0)
 
 	log.Println("[UPDATE] Refreshing proxy list...")
 	list := fetchProxyList()
@@ -507,6 +514,7 @@ type StatusResponse struct {
 	Strict         PoolStatus `json:"strict"`
 	Relaxed        PoolStatus `json:"relaxed"`
 	LastUpdateTime string     `json:"last_update_time"`
+	IsUpdating     bool       `json:"is_updating"`
 }
 
 func handleAdminStatus(w http.ResponseWriter, r *http.Request) {
@@ -525,6 +533,13 @@ func handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		lastUpdate = "never"
 	}
 
+	// CRITICAL FIX: Check BOTH pools for updating status
+	// Since they're always updated together, checking either is sufficient,
+	// but for correctness we should check both (they should always match)
+	strictUpdating := atomic.LoadInt32(&strictPool.updating) == 1
+	relaxedUpdating := atomic.LoadInt32(&relaxedPool.updating) == 1
+	isUpdating := strictUpdating || relaxedUpdating
+
 	response := StatusResponse{
 		Strict: PoolStatus{
 			Total:     strictPool.GetTotalCount(),
@@ -535,6 +550,7 @@ func handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 			Countries: relaxedStats,
 		},
 		LastUpdateTime: lastUpdate,
+		IsUpdating:     isUpdating,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -568,6 +584,15 @@ func main() {
 	if config.UpdateIntervalMinutes <= 0 {
 		config.UpdateIntervalMinutes = 5
 	}
+
+	// Override with environment variable if present
+	if envVal := os.Getenv("UPDATE_INTERVAL_MINUTES"); envVal != "" {
+		if val, err := strconv.Atoi(envVal); err == nil {
+			config.UpdateIntervalMinutes = val
+			log.Printf("[BOOT] Overriding update_interval_minutes from ENV: %d minutes", val)
+		}
+	}
+
 	if config.HealthCheck.TotalTimeoutSeconds <= 0 {
 		config.HealthCheck.TotalTimeoutSeconds = 8
 	}
@@ -621,9 +646,6 @@ func main() {
 		}
 	}()
 
-	hS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, strictPool, "STRICT") })
-	hR := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, relaxedPool, "RELAXED") })
-
 	// Admin interface on :17288
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("/status", handleAdminStatus)
@@ -633,6 +655,10 @@ func main() {
 	log.Println("[BOOT] Admin interface on :17288")
 	
 	go http.ListenAndServe(":17288", adminMux)
+	
+	hS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, strictPool, "STRICT") })
+	hR := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, relaxedPool, "RELAXED") })
+
 	go http.ListenAndServe(config.Ports.HTTPStrict, hS)
 	http.ListenAndServe(config.Ports.HTTPRelaxed, hR)
 }
