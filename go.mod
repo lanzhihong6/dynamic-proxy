@@ -3,7 +3,7 @@ module dynamic-proxy
 go 1.21
 
 require (
-	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
+	github.com/lionsoul2014/ip2region/binding/golang v0.0.0-20240510063043-307a34203b9c
 	golang.org/x/net v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 )
