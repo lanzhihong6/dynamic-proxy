@@ -236,7 +236,7 @@ func main() {
 	config = *cfg
 
 	// Load ip2region
-	cPath := "ip2region.xdb"
+	cPath := "ip2region_v4.xdb"
 	v, err := xdb.LoadContentFromFile(cPath)
 	if err != nil {
 		log.Printf("[BOOT] Failed to load xdb: %v", err)
