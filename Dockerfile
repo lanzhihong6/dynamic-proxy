@@ -2,14 +2,12 @@
 FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
-
-# Install build dependencies: git is required for go mod download
 RUN apk add --no-cache git ca-certificates wget
 
-COPY go.mod go.sum ./
-RUN go mod download
+COPY go.mod ./
+# 移除 go.sum 复制，让构建环境自己生成最新的
+RUN go mod download || go get github.com/lionsoul2014/ip2region/binding/golang
 
-# Download the latest ip2region database
 RUN wget https://github.com/lionsoul2014/ip2region/raw/master/data/ip2region.xdb -O ip2region.xdb
 
 COPY main.go ./
