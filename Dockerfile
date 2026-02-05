@@ -4,20 +4,16 @@ FROM golang:1.21-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git ca-certificates wget
 
-# 1. 先准备依赖
 COPY go.mod ./
-# 使用 go get 强制同步正确的依赖
-RUN go mod download || true
-RUN go get github.com/lionsoul2014/ip2region/binding/golang@v0.0.0-20240510063043-307a34203b9c
+# 此时 go.mod 是空的，我们需要通过 go get 拉取所有依赖
+RUN go get github.com/lionsoul2014/ip2region/binding/golang@latest
 RUN go get golang.org/x/net/proxy
 RUN go get gopkg.in/yaml.v3
 RUN go mod tidy
 
-# 2. 下载数据库
 RUN wget https://github.com/lionsoul2014/ip2region/raw/master/data/ip2region_v4.xdb -O ip2region_v4.xdb
 RUN wget https://github.com/lionsoul2014/ip2region/raw/master/data/ip2region_v6.xdb -O ip2region_v6.xdb
 
-# 3. 复制代码并构建
 COPY main.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -v -o dynamic-proxy .
 
