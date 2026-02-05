@@ -43,10 +43,16 @@ type ProxyInfo struct {
 var (
 	config           Config
 	simpleProxyRegex = regexp.MustCompile(`([0-9a-fA-F:]{3,}|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
-	
-	// Store IP2Region databases as byte buffers in memory for thread-safe access
+
+	// Store IP2Region databases as byte buffers in memory
+	// These are read-only after initialization - safe for concurrent reads
 	ip2regionV4Buffer []byte
 	ip2regionV6Buffer []byte
+
+	// Searcher pools for thread-safe concurrent access
+	// Each goroutine gets its own Searcher instance from the pool
+	searcherV4Pool *sync.Pool
+	searcherV6Pool *sync.Pool
 )
 
 type ProxyPool struct {
@@ -115,35 +121,95 @@ func fetchProxyList() []string {
 	return list
 }
 
-// getCountryCode creates a temporary searcher for each lookup to ensure thread safety
+// initSearcherPools initializes the sync.Pool for Searcher instances
+// This MUST be called after loading the xdb buffers
+func initSearcherPools() {
+	if ip2regionV4Buffer != nil {
+		searcherV4Pool = &sync.Pool{
+			New: func() interface{} {
+				// CRITICAL: Must pass xdb.IPv4, NOT nil!
+				// Passing nil causes s.version to be nil, which leads to
+				// nil pointer dereference when accessing s.version.Bytes in Search()
+				searcher, err := xdb.NewWithBuffer(xdb.IPv4, ip2regionV4Buffer)
+				if err != nil {
+					log.Printf("[WARN] Failed to create V4 searcher in pool: %v", err)
+					return nil
+				}
+				return searcher
+			},
+		}
+	}
+
+	if ip2regionV6Buffer != nil {
+		searcherV6Pool = &sync.Pool{
+			New: func() interface{} {
+				// CRITICAL: Must pass xdb.IPv6, NOT nil!
+				searcher, err := xdb.NewWithBuffer(xdb.IPv6, ip2regionV6Buffer)
+				if err != nil {
+					log.Printf("[WARN] Failed to create V6 searcher in pool: %v", err)
+					return nil
+				}
+				return searcher
+			},
+		}
+	}
+}
+
+// getCountryCode looks up the country code for an IP address
+// Uses sync.Pool for thread-safe Searcher access
 func getCountryCode(ipAddr string) string {
-	var buffer []byte
-	if strings.Contains(ipAddr, ":") {
-		buffer = ip2regionV6Buffer
+	var pool *sync.Pool
+	isV6 := strings.Contains(ipAddr, ":")
+
+	if isV6 {
+		pool = searcherV6Pool
 	} else {
-		buffer = ip2regionV4Buffer
+		pool = searcherV4Pool
 	}
-	
-	if buffer == nil {
+
+	if pool == nil {
 		return "XX"
 	}
-	
-	// Create a temporary searcher for this query (thread-safe approach)
-	searcher, err := xdb.NewWithBuffer(nil, buffer)
+
+	// Get a searcher from the pool
+	searcherIface := pool.Get()
+	if searcherIface == nil {
+		return "XX"
+	}
+
+	searcher, ok := searcherIface.(*xdb.Searcher)
+	if !ok || searcher == nil {
+		return "XX"
+	}
+
+	// Put the searcher back when done
+	// Note: xdb.Searcher created with NewWithBuffer has no file handle,
+	// so Close() is a no-op and we can safely reuse it
+	defer pool.Put(searcher)
+
+	// Perform the search with panic recovery as last resort
+	var region string
+	var err error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[WARN] Panic in ip2region search for %s: %v", ipAddr, r)
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		region, err = searcher.SearchByStr(ipAddr)
+	}()
+
 	if err != nil {
 		return "XX"
 	}
-	defer searcher.Close()
-	
-	region, err := searcher.SearchByStr(ipAddr)
-	if err != nil {
-		return "XX"
-	}
-	
+
 	parts := strings.Split(region, "|")
-	if len(parts) < 1 {
+	if len(parts) < 1 || parts[0] == "" {
 		return "XX"
 	}
+
 	countryName := parts[0]
 	switch countryName {
 	case "韩国":
@@ -164,7 +230,33 @@ func getCountryCode(ipAddr string) string {
 		return "HK"
 	case "台湾":
 		return "TW"
+	case "加拿大":
+		return "CA"
+	case "澳大利亚":
+		return "AU"
+	case "法国":
+		return "FR"
+	case "荷兰":
+		return "NL"
+	case "俄罗斯":
+		return "RU"
+	case "巴西":
+		return "BR"
+	case "印度":
+		return "IN"
+	case "意大利":
+		return "IT"
+	case "西班牙":
+		return "ES"
+	case "瑞士":
+		return "CH"
+	case "瑞典":
+		return "SE"
 	default:
+		// If it's already a 2-letter code, return as-is
+		if len(countryName) == 2 {
+			return strings.ToUpper(countryName)
+		}
 		return countryName
 	}
 }
@@ -312,23 +404,23 @@ func main() {
 		log.Fatalf("[FATAL] Could not read ip2region_v4.xdb: %v", err)
 	}
 	ip2regionV4Buffer = v4b
-	
-	// Validate V4 database by creating a test searcher
-	testSearcher, err := xdb.NewWithBuffer(nil, ip2regionV4Buffer)
+
+	// Validate V4 database by creating a test searcher with proper version
+	testSearcher, err := xdb.NewWithBuffer(xdb.IPv4, ip2regionV4Buffer)
 	if err != nil {
 		log.Fatalf("[FATAL] Could not initialize v4 searcher: %v", err)
 	}
 	testSearcher.Close()
-	log.Println("[BOOT] IPv4 database loaded successfully")
+	log.Println("[BOOT] IPv4 database loaded and validated successfully")
 
 	// Load IPv6 database into memory - OPTIONAL
 	v6b, err := os.ReadFile("ip2region_v6.xdb")
 	if err == nil {
 		ip2regionV6Buffer = v6b
-		testSearcherV6, err := xdb.NewWithBuffer(nil, ip2regionV6Buffer)
+		testSearcherV6, err := xdb.NewWithBuffer(xdb.IPv6, ip2regionV6Buffer)
 		if err == nil {
 			testSearcherV6.Close()
-			log.Println("[BOOT] IPv6 database loaded successfully")
+			log.Println("[BOOT] IPv6 database loaded and validated successfully")
 		} else {
 			log.Printf("[WARN] IPv6 database file found but invalid: %v", err)
 			ip2regionV6Buffer = nil
@@ -336,6 +428,10 @@ func main() {
 	} else {
 		log.Printf("[WARN] IPv6 database not found (optional): %v", err)
 	}
+
+	// Initialize searcher pools AFTER loading buffers
+	initSearcherPools()
+	log.Println("[BOOT] Searcher pools initialized")
 
 	sp, rp := &ProxyPool{}, &ProxyPool{}
 	log.Println("[BOOT] Initial health check starting...")
