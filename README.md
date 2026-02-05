@@ -21,6 +21,7 @@ A high-performance SOCKS5/HTTP dynamic proxy server that automatically fetches, 
 - 🎯 **Smart Filtering**: Automatically removes slow and unreliable proxies
 - 🔁 **Auto Update**: Periodic proxy pool refresh (configurable interval)
 - ⚓ **Sticky Sessions**: Support for persistent IP sessions via `X-Proxy-Session` header
+- 🌍 **Region Selection**: Support for selecting specific countries via `X-Proxy-Country` header (e.g., `KR`, `US`)
 - 🔐 **Dual Mode**: Strict mode (SSL verification enabled) and Relaxed mode (SSL verification disabled)
 
 ### Quick Start
@@ -370,6 +371,7 @@ MIT License
 - 🎯 **智能过滤**: 自动移除慢速和不可靠的代理
 - 🔁 **自动更新**: 定期刷新代理池（可配置间隔）
 - ⚓ **固定会话**: 支持通过 `X-Proxy-Session` 请求头实现固定 IP 会话
+- 🌍 **区域选择**: 支持通过 `X-Proxy-Country` 请求头选择特定国家 (如 `KR`, `US`)
 - 🔐 **双模式**: 严格模式（启用SSL验证）和宽松模式（禁用SSL验证）
 
 ### 快速开始
