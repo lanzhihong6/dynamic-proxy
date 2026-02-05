@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -143,12 +141,6 @@ func getCountryCode(ipAddr string) string {
 		return "JP"
 	case "中国":
 		return "CN"
-	case "英国":
-		return "GB"
-	case "德国":
-		return "DE"
-	case "新加坡":
-		return "SG"
 	case "香港":
 		return "HK"
 	case "台湾":
@@ -290,28 +282,19 @@ func main() {
 	if config.UpdateIntervalMinutes <= 0 {
 		config.UpdateIntervalMinutes = 5
 	}
-	if config.HealthCheck.TotalTimeoutSeconds <= 0 {
-		config.HealthCheck.TotalTimeoutSeconds = 8
-	}
-	if config.Ports.HTTPStrict == "" {
-		config.Ports.HTTPStrict = ":17285"
-	}
-	if config.Ports.HTTPRelaxed == "" {
-		config.Ports.HTTPRelaxed = ":17286"
-	}
 
-	// Load ip2region databases
+	// 加载双库，使用正确的参数：nil 作为第一个参数
 	v4b, err := os.ReadFile("ip2region_v4.xdb")
 	if err == nil {
-		searcherV4, _ = xdb.NewWithBuffer(v4b)
+		searcherV4, _ = xdb.NewWithBuffer(nil, v4b)
 	}
 	v6b, err := os.ReadFile("ip2region_v6.xdb")
 	if err == nil {
-		searcherV6, _ = xdb.NewWithBuffer(v6b)
+		searcherV6, _ = xdb.NewWithBuffer(nil, v6b)
 	}
 
 	sp, rp := &ProxyPool{}, &ProxyPool{}
-	log.Println("[BOOT] Initial health check starting...")
+	log.Println("[BOOT] Starting initial health check...")
 	updatePools(sp, rp)
 
 	go func() {
@@ -324,7 +307,7 @@ func main() {
 	hS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, sp, "STRICT") })
 	hR := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, rp, "RELAXED") })
 
-	log.Printf("[BOOT] Servers on %s and %s", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
-	go http.ListenAndServe(config.Ports.HTTPStrict, hS)
-	http.ListenAndServe(config.Ports.HTTPRelaxed, hR)
+	log.Printf("[BOOT] Servers on :17285 and :17286")
+	go http.ListenAndServe(":17285", hS)
+	http.ListenAndServe(":17286", hR)
 }
