@@ -5,8 +5,12 @@ WORKDIR /app
 RUN apk add --no-cache git ca-certificates wget
 
 COPY go.mod ./
-# 移除 go.sum 复制，让构建环境自己生成最新的
-RUN go mod download || go get github.com/lionsoul2014/ip2region/binding/golang
+# 先下载基础依赖
+RUN go mod download
+# 显式获取 ip2region 的最新 master 版本，不带那个该死的哈希
+RUN go get github.com/lionsoul2014/ip2region/binding/golang@master
+# 整理依赖
+RUN go mod tidy
 
 RUN wget https://github.com/lionsoul2014/ip2region/raw/master/data/ip2region.xdb -O ip2region.xdb
 
