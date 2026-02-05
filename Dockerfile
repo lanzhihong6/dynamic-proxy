@@ -4,15 +4,18 @@ FROM golang:1.21-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git ca-certificates wget
 
+# 1. 复制基础文件
 COPY go.mod ./
-RUN go get github.com/lionsoul2014/ip2region/binding/golang@master
+COPY main.go ./
+
+# 2. 只有代码在位时，tidy 才能自动识别出代码里用到的包
 RUN go mod tidy
 
-# 使用官方 raw 域名，确保 100% 成功下载
+# 3. 下载数据库
 RUN wget https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb -O ip2region_v4.xdb
 RUN wget https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v6.xdb -O ip2region_v6.xdb
 
-COPY main.go ./
+# 4. 构建
 RUN CGO_ENABLED=0 GOOS=linux go build -v -o dynamic-proxy .
 
 # Final stage
