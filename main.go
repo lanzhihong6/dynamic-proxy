@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -43,15 +44,16 @@ type ProxyInfo struct {
 
 var (
 	config           Config
-	simpleProxyRegex = regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
-	searcher         *xdb.Searcher
+	simpleProxyRegex = regexp.MustCompile(`([0-9a-fA-F:]{3,}|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
+	searcherV4       *xdb.Searcher
+	searcherV6       *xdb.Searcher
 )
 
 func loadConfig(filename string) (*Config, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil { return nil, err }
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil { return nil, err }
+	yaml.Unmarshal(data, &cfg)
 	if cfg.HealthCheckConcurrency <= 0 { cfg.HealthCheckConcurrency = 200 }
 	if cfg.UpdateIntervalMinutes <= 0 { cfg.UpdateIntervalMinutes = 5 }
 	if cfg.HealthCheck.TotalTimeoutSeconds <= 0 { cfg.HealthCheck.TotalTimeoutSeconds = 8 }
@@ -61,11 +63,17 @@ func loadConfig(filename string) (*Config, error) {
 }
 
 func getCountryCode(ipAddr string) string {
-	if searcher == nil { return "XX" }
-	region, err := searcher.SearchByStr(ipAddr)
+	var s *xdb.Searcher
+	if strings.Contains(ipAddr, ":") {
+		s = searcherV6
+	} else {
+		s = searcherV4
+	}
+	if s == nil { return "XX" }
+	
+	region, err := s.SearchByStr(ipAddr)
 	if err != nil { return "XX" }
 	
-	// region format: 国家|区域|省份|城市|ISP
 	parts := strings.Split(region, "|")
 	if len(parts) < 1 { return "XX" }
 	
@@ -78,10 +86,9 @@ func getCountryCode(ipAddr string) string {
 	case "英国": return "GB"
 	case "德国": return "DE"
 	case "新加坡": return "SG"
-	default: 
-		// 简单映射，如果不在常用列表中，返回前两个字作为标识或保持原样
-		log.Printf("[GEO] Unknown mapping for: %s", countryName)
-		return countryName 
+	case "Hong Kong", "香港": return "HK"
+	case "Taiwan", "台湾": return "TW"
+	default: return countryName 
 	}
 }
 
@@ -100,8 +107,7 @@ func (p *ProxyPool) Update(proxies []ProxyInfo) {
 func (p *ProxyPool) GetNext(session, country string) (string, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if len(p.proxies) == 0 { return "", fmt.Errorf("proxy pool is empty") }
-	
+	if len(p.proxies) == 0 { return "", fmt.Errorf("proxy pool empty") }
 	var cands []ProxyInfo
 	if country != "" {
 		for _, pr := range p.proxies {
@@ -111,8 +117,7 @@ func (p *ProxyPool) GetNext(session, country string) (string, error) {
 	} else {
 		cands = p.proxies
 	}
-	
-	var idx uint64
+	idx := uint64(0)
 	if session != "" {
 		h := fnv.New32a(); h.Write([]byte(session))
 		idx = uint64(h.Sum32()) % uint64(len(cands))
@@ -141,15 +146,12 @@ func fetchProxyList() []string {
 func check(addr string, strict bool) (bool, string) {
 	host, _, _ := net.SplitHostPort(addr)
 	country := getCountryCode(host)
-	
 	timeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
 	dialer, err := proxy.SOCKS5("tcp", addr, nil, &net.Dialer{Timeout: timeout})
 	if err != nil { return false, "" }
-
 	conn, err := dialer.Dial("tcp", "www.google.com:443")
 	if err != nil { return false, "" }
 	defer conn.Close()
-
 	if strict {
 		tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: false, ServerName: "www.google.com"})
 		if err := tlsConn.Handshake(); err != nil { return false, "" }
@@ -158,33 +160,26 @@ func check(addr string, strict bool) (bool, string) {
 	return true, country
 }
 
-func performUpdate(sp, rp *ProxyPool) {
-	log.Println("[UPDATE] Refreshing proxy list...")
-	raw := fetchProxyList()
-	total := len(raw)
-	log.Printf("[UPDATE] Testing %d candidates with concurrency %d...", total, config.HealthCheckConcurrency)
-
+func update(sp, rp *ProxyPool) {
+	if !atomic.CompareAndSwapInt32(&sp.updating, 0, 1) { return }
+	defer atomic.StoreInt32(&sp.updating, 0)
+	list := fetchProxyList()
 	var s, r []ProxyInfo
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var checked int64
 	sem := make(chan struct{}, config.HealthCheckConcurrency)
-	
-	for _, a := range raw {
+	for _, a := range list {
 		wg.Add(1)
 		go func(addr string) {
-			defer wg.Done()
-			sem <- struct{}{}; defer func(){ <-sem }()
-			
-			if okS, cS := check(addr, true); okS {
-				mu.Lock(); info := ProxyInfo{addr, cS}; s = append(s, info); r = append(r, info); mu.Unlock()
-			} else if okR, cR := check(addr, false); okR {
-				mu.Lock(); r = append(r, ProxyInfo{addr, cR}); mu.Unlock()
+			defer wg.Done(); sem <- struct{}{}; defer func(){ <-sem }()
+			if ok, c := check(addr, true); ok {
+				mu.Lock(); info := ProxyInfo{addr, c}; s = append(s, info); r = append(r, info); mu.Unlock()
+			} else if ok, c := check(addr, false); ok {
+				mu.Lock(); r = append(r, ProxyInfo{addr, c}); mu.Unlock()
 			}
 			val := atomic.AddInt64(&checked, 1)
-			if val%50 == 0 || val == int64(total) {
-				log.Printf("[UPDATE] Progress: %d/%d", val, total)
-			}
+			if val%100 == 0 || val == int64(len(list)) { log.Printf("[UPDATE] Progress: %d/%d", val, len(list)) }
 		}(a)
 	}
 	wg.Wait()
@@ -193,34 +188,25 @@ func performUpdate(sp, rp *ProxyPool) {
 }
 
 func handleHTTP(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
-	session := r.Header.Get("X-Proxy-Session")
-	country := r.Header.Get("X-Proxy-Country")
+	session, country := r.Header.Get("X-Proxy-Session"), r.Header.Get("X-Proxy-Country")
 	proxyAddr, err := pool.GetNext(session, country)
-	if err != nil {
-		http.Error(w, err.Error(), 503); return
-	}
+	if err != nil { http.Error(w, err.Error(), 503); return }
 
 	dialer, _ := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
-
 	if r.Method == http.MethodConnect || r.URL.Scheme == "https" {
 		target := r.Host
 		if target == "" { target = r.URL.Host }
 		dest, err := dialer.Dial("tcp", target)
 		if err != nil { http.Error(w, err.Error(), 502); return }
 		defer dest.Close()
-		
 		hj, _ := w.(http.Hijacker)
 		conn, _, _ := hj.Hijack()
 		defer conn.Close()
-		
-		if r.Method == http.MethodConnect {
-			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		}
+		if r.Method == http.MethodConnect { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 		go io.Copy(dest, conn)
 		io.Copy(conn, dest)
 		return
 	}
-
 	transport := &http.Transport{Dial: dialer.Dial, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	resp, err := transport.RoundTrip(r)
 	if err != nil { http.Error(w, err.Error(), 502); return }
@@ -231,35 +217,21 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode st
 }
 
 func main() {
-	cfg, err := loadConfig("config.yaml")
-	if err != nil { log.Fatal(err) }
-	config = *cfg
-
-	// Load ip2region
-	cPath := "ip2region_v4.xdb"
-	v, err := xdb.LoadContentFromFile(cPath)
-	if err != nil {
-		log.Printf("[BOOT] Failed to load xdb: %v", err)
-	} else {
-		searcher, err = xdb.NewWithBuffer(v)
-		if err != nil { log.Printf("[BOOT] Failed to create searcher: %v", err) }
-	}
+	cfg, _ := loadConfig("config.yaml"); config = *cfg
+	
+	// Load both databases
+	v4b, _ := os.ReadFile("ip2region_v4.xdb")
+	searcherV4, _ = xdb.NewWithBuffer(v4b)
+	v6b, _ := os.ReadFile("ip2region_v6.xdb")
+	searcherV6, _ = xdb.NewWithBuffer(v6b)
 
 	sp, rp := &ProxyPool{}, &ProxyPool{}
-	log.Println("[BOOT] Initial health check starting...")
-	performUpdate(sp, rp)
-
 	go func() {
-		for {
-			time.Sleep(time.Duration(config.UpdateIntervalMinutes) * time.Minute)
-			performUpdate(sp, rp)
-		}
+		for { update(sp, rp); time.Sleep(time.Duration(config.UpdateIntervalMinutes) * time.Minute) }
 	}()
-
 	hS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, sp, "STRICT") })
 	hR := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleHTTP(w, r, rp, "RELAXED") })
-	
-	log.Printf("[BOOT] Servers on %s and %s", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
 	go http.ListenAndServe(config.Ports.HTTPStrict, hS)
+	log.Printf("Servers on %s and %s (V4/V6 Enabled)", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
 	http.ListenAndServe(config.Ports.HTTPRelaxed, hR)
 }
