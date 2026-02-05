@@ -43,7 +43,7 @@ type Config struct {
 
 type ProxyInfo struct {
 	Addr    string
-	Country string // ISO Country Code (e.g., KR, US)
+	Country string // ISO Country Code
 }
 
 var config Config
@@ -55,41 +55,18 @@ func loadConfig(filename string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
-
-	// Validate config
-	if len(cfg.ProxyListURLs) == 0 {
-		return nil, fmt.Errorf("at least one proxy_list_url must be specified")
-	}
-	if cfg.HealthCheckConcurrency <= 0 {
-		cfg.HealthCheckConcurrency = 200
-	}
-	if cfg.UpdateIntervalMinutes <= 0 {
-		cfg.UpdateIntervalMinutes = 5
-	}
-	if cfg.HealthCheck.TotalTimeoutSeconds <= 0 {
-		cfg.HealthCheck.TotalTimeoutSeconds = 8
-	}
-	if cfg.HealthCheck.TLSHandshakeThresholdSeconds <= 0 {
-		cfg.HealthCheck.TLSHandshakeThresholdSeconds = 5
-	}
-	if cfg.Ports.SOCKS5Strict == "" {
-		cfg.Ports.SOCKS5Strict = ":17283"
-	}
-	if cfg.Ports.SOCKS5Relaxed == "" {
-		cfg.Ports.SOCKS5Relaxed = ":17284"
-	}
-	if cfg.Ports.HTTPStrict == "" {
-		cfg.Ports.HTTPStrict = ":17285"
-	}
-	if cfg.Ports.HTTPRelaxed == "" {
-		cfg.Ports.HTTPRelaxed = ":17286"
-	}
-
+	if cfg.HealthCheckConcurrency <= 0 { cfg.HealthCheckConcurrency = 200 }
+	if cfg.UpdateIntervalMinutes <= 0 { cfg.UpdateIntervalMinutes = 5 }
+	if cfg.HealthCheck.TotalTimeoutSeconds <= 0 { cfg.HealthCheck.TotalTimeoutSeconds = 8 }
+	if cfg.HealthCheck.TLSHandshakeThresholdSeconds <= 0 { cfg.HealthCheck.TLSHandshakeThresholdSeconds = 5 }
+	if cfg.Ports.SOCKS5Strict == "" { cfg.Ports.SOCKS5Strict = ":17283" }
+	if cfg.Ports.SOCKS5Relaxed == "" { cfg.Ports.SOCKS5Relaxed = ":17284" }
+	if cfg.Ports.HTTPStrict == "" { cfg.Ports.HTTPStrict = ":17285" }
+	if cfg.Ports.HTTPRelaxed == "" { cfg.Ports.HTTPRelaxed = ":17286" }
 	return &cfg, nil
 }
 
@@ -101,20 +78,15 @@ type ProxyPool struct {
 }
 
 func NewProxyPool() *ProxyPool {
-	return &ProxyPool{
-		proxies: make([]ProxyInfo, 0),
-	}
+	return &ProxyPool{proxies: make([]ProxyInfo, 0)}
 }
 
 func (p *ProxyPool) Update(proxies []ProxyInfo) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	oldCount := len(p.proxies)
 	p.proxies = proxies
 	atomic.StoreUint64(&p.index, 0)
-
-	log.Printf("Proxy pool updated: %d -> %d active proxies", oldCount, len(proxies))
+	log.Printf("[POOL] Updated: %d active proxies", len(proxies))
 }
 
 func (p *ProxyPool) GetNext(session, country string) (string, error) {
@@ -125,7 +97,6 @@ func (p *ProxyPool) GetNext(session, country string) (string, error) {
 		return "", fmt.Errorf("no available proxies")
 	}
 
-	// Filter by country if requested
 	var candidates []ProxyInfo
 	if country != "" {
 		for _, pr := range p.proxies {
@@ -134,56 +105,21 @@ func (p *ProxyPool) GetNext(session, country string) (string, error) {
 			}
 		}
 		if len(candidates) == 0 {
-			return "", fmt.Errorf("no available proxies in country: %s", country)
+			return "", fmt.Errorf("no proxies in %s", country)
 		}
 	} else {
 		candidates = p.proxies
 	}
 
-	// Sticky session logic
+	targetIdx := uint64(0)
 	if session != "" {
 		h := fnv.New32a()
 		h.Write([]byte(session))
-		idx := uint64(h.Sum32()) % uint64(len(candidates))
-		return candidates[idx].Addr, nil
+		targetIdx = uint64(h.Sum32()) % uint64(len(candidates))
+	} else {
+		targetIdx = atomic.AddUint64(&p.index, 1) % uint64(len(candidates))
 	}
-
-	// Round-robin logic
-	idx := atomic.AddUint64(&p.index, 1) % uint64(len(candidates))
-	return candidates[idx].Addr, nil
-}
-
-func (p *ProxyPool) GetAll() []ProxyInfo {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	result := make([]ProxyInfo, len(p.proxies))
-	copy(result, p.proxies)
-	return result
-}
-
-// parseSpecialProxyURL extracts ip:port using regex
-func parseSpecialProxyURL(content string) ([]string, error) {
-	var proxies []string
-	proxySet := make(map[string]bool)
-
-	lines := strings.Split(content, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		matches := simpleProxyRegex.FindStringSubmatch(line)
-		if len(matches) >= 3 {
-			proxy := fmt.Sprintf("%s:%s", matches[1], matches[2])
-			if !proxySet[proxy] {
-				proxySet[proxy] = true
-				proxies = append(proxies, proxy)
-			}
-		}
-	}
-
-	return proxies, nil
+	return candidates[targetIdx].Addr, nil
 }
 
 func fetchProxyList() ([]string, error) {
@@ -191,287 +127,157 @@ func fetchProxyList() ([]string, error) {
 	allProxies := make([]string, 0)
 	proxySet := make(map[string]bool)
 
-	for _, url := range config.ProxyListURLs {
+	urls := append(config.ProxyListURLs, config.SpecialProxyListUrls...)
+	for _, url := range urls {
 		resp, err := client.Get(url)
-		if err != nil {
-			continue
-		}
+		if err != nil { log.Printf("[FETCH] Failed %s: %v", url, err); continue }
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		scanner := bufio.NewScanner(strings.NewReader(string(body)))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			line = strings.TrimPrefix(line, "socks5://")
-			line = strings.TrimPrefix(line, "socks4://")
-			line = strings.TrimPrefix(line, "https://")
-			line = strings.TrimPrefix(line, "http://")
-
-			if !proxySet[line] {
-				proxySet[line] = true
-				allProxies = append(allProxies, line)
+		// Regex based extraction for all sources to be safe
+		matches := simpleProxyRegex.FindAllString(string(body), -1)
+		for _, m := range matches {
+			if !proxySet[m] {
+				proxySet[m] = true
+				allProxies = append(allProxies, m)
 			}
 		}
 	}
-
-	for _, url := range config.SpecialProxyListUrls {
-		resp, err := client.Get(url)
-		if err != nil {
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		special, _ := parseSpecialProxyURL(string(body))
-		for _, p := range special {
-			if !proxySet[p] {
-				proxySet[p] = true
-				allProxies = append(allProxies, p)
-			}
-		}
-	}
-
 	return allProxies, nil
 }
 
-// checkProxyHealthWithGeo tests proxy and returns country code
-func checkProxyHealthWithGeo(proxyAddr string, strictMode bool) (bool, string) {
+func checkProxyHealth(proxyAddr string, strictMode bool) (bool, string) {
 	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, &net.Dialer{Timeout: totalTimeout})
-	if err != nil {
-		return false, ""
-	}
+	if err != nil { return false, "" }
 
+	// Phase 1: Rapid TCP/TLS Handshake
+	conn, err := dialer.Dial("tcp", "www.google.com:443")
+	if err != nil { return false, "" }
+	defer conn.Close()
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: !strictMode, ServerName: "www.google.com"})
+	if err := tlsConn.Handshake(); err != nil { return false, "" }
+	tlsConn.Close()
+
+	// Phase 2: Geo Lookup (Only for healthy proxies)
 	client := &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
-			},
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: !strictMode},
+			DialContext: func(ctx context.Context, n, a string) (net.Conn, error) { return dialer.Dial(n, a) },
 		},
-		Timeout: totalTimeout,
+		Timeout: 5 * time.Second,
 	}
-
-	// 1. Health check & GeoIP query
 	resp, err := client.Get("http://ip-api.com/json")
-	if err != nil {
-		return false, ""
+	if err == nil {
+		defer resp.Body.Close()
+		var geo struct { Status string `json:"status"`; Country string `json:"countryCode"` }
+		if json.NewDecoder(resp.Body).Decode(&geo) == nil && geo.Status == "success" {
+			return true, geo.Country
+		}
 	}
-	defer resp.Body.Close()
-
-	var geo struct {
-		Status  string `json:"status"`
-		Country string `json:"countryCode"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&geo); err != nil || geo.Status != "success" {
-		// Even if Geo lookup fails, the proxy is technically "up"
-		return true, "XX"
-	}
-
-	return true, geo.Country
+	return true, "XX"
 }
 
 func healthCheckProxies(proxies []string) HealthCheckResult {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	strictHealthy := make([]ProxyInfo, 0)
-	relaxedHealthy := make([]ProxyInfo, 0)
-	semaphore := make(chan struct{}, config.HealthCheckConcurrency)
+	strict := make([]ProxyInfo, 0)
+	relaxed := make([]ProxyInfo, 0)
+	sem := make(chan struct{}, config.HealthCheckConcurrency)
 
 	for _, addr := range proxies {
 		wg.Add(1)
-		go func(proxyAddr string) {
+		go func(a string) {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			ok, country := checkProxyHealthWithGeo(proxyAddr, true)
-			if ok {
-				mu.Lock()
-				info := ProxyInfo{Addr: proxyAddr, Country: country}
-				strictHealthy = append(strictHealthy, info)
-				relaxedHealthy = append(relaxedHealthy, info)
+			sem <- struct{}{}; defer func(){ <-sem }()
+			if ok, country := checkProxyHealth(a, true); ok {
+				mu.Lock(); info := ProxyInfo{Addr: a, Country: country}
+				strict = append(strict, info); relaxed = append(relaxed, info)
 				mu.Unlock()
-			} else {
-				okRel, countryRel := checkProxyHealthWithGeo(proxyAddr, false)
-				if okRel {
-					mu.Lock()
-					relaxedHealthy = append(relaxedHealthy, ProxyInfo{Addr: proxyAddr, Country: countryRel})
-					mu.Unlock()
-				}
+			} else if ok, country := checkProxyHealth(a, false); ok {
+				mu.Lock(); relaxed = append(relaxed, ProxyInfo{Addr: a, Country: country}); mu.Unlock()
 			}
 		}(addr)
 	}
 	wg.Wait()
-	return HealthCheckResult{Strict: strictHealthy, Relaxed: relaxedHealthy}
+	return HealthCheckResult{strict, relaxed}
 }
 
-type HealthCheckResult struct {
-	Strict  []ProxyInfo
-	Relaxed []ProxyInfo
-}
+type HealthCheckResult struct { Strict, Relaxed []ProxyInfo }
 
-func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
-	if !atomic.CompareAndSwapInt32(&strictPool.updating, 0, 1) {
-		return
-	}
+func updateProxyPool(strictPool, relaxedPool *ProxyPool) {
+	if !atomic.CompareAndSwapInt32(&strictPool.updating, 0, 1) { return }
 	defer atomic.StoreInt32(&strictPool.updating, 0)
 
-	proxies, err := fetchProxyList()
-	if err != nil {
-		return
-	}
-
-	result := healthCheckProxies(proxies)
-	if len(result.Strict) > 0 {
-		strictPool.Update(result.Strict)
-	}
-	if len(result.Relaxed) > 0 {
-		relaxedPool.Update(result.Relaxed)
-	}
-}
-
-func startProxyUpdater(strictPool *ProxyPool, relaxedPool *ProxyPool, initialSync bool) {
-	if initialSync {
-		updateProxyPool(strictPool, relaxedPool)
-	}
-	ticker := time.NewTicker(time.Duration(config.UpdateIntervalMinutes) * time.Minute)
-	go func() {
-		for range ticker.C {
-			updateProxyPool(strictPool, relaxedPool)
-		}
-	}()
-}
-
-// SOCKS5/HTTP Server logic...
-type CustomDialer struct {
-	pool    *ProxyPool
-	mode    string
-	session string
-	country string
-}
-
-func (d *CustomDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	proxyAddr, err := d.pool.GetNext(d.session, d.country)
-	if err != nil {
-		return nil, err
-	}
-	dialer, _ := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
-	return dialer.Dial(network, addr)
-}
-
-func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
-	conf := &socks5.Config{
-		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// SOCKS5 doesn't easily carry extra headers, 
-			// so session/country would need to be encoded in username or ignored for now.
-			dialer := &CustomDialer{pool: pool, mode: mode}
-			return dialer.Dial(ctx, network, addr)
-		},
-	}
-	server, _ := socks5.New(conf)
-	return server.ListenAndServe("tcp", port)
+	log.Println("[UPDATE] Refreshing proxy list...")
+	list, _ := fetchProxyList()
+	res := healthCheckProxies(list)
+	strictPool.Update(res.Strict)
+	relaxedPool.Update(res.Relaxed)
 }
 
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
 	session := r.Header.Get("X-Proxy-Session")
 	country := r.Header.Get("X-Proxy-Country")
-
 	proxyAddr, err := pool.GetNext(session, country)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		log.Printf("[HTTP-%s] No proxy: %v", mode, err)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable); return
 	}
-
-	log.Printf("[HTTP-%s] Using proxy %s (Session: %s, Country: %s)", mode, proxyAddr, session, country)
 
 	dialer, _ := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if r.Method == http.MethodConnect {
-		handleHTTPSProxy(w, r, dialer, proxyAddr, mode)
+		log.Printf("[HTTPS-%s] Tunnel: %s via %s", mode, r.Host, proxyAddr)
+		targetConn, err := dialer.Dial("tcp", r.Host)
+		if err != nil { http.Error(w, err.Error(), http.StatusBadGateway); return }
+		defer targetConn.Close()
+		
+		hijacker, _ := w.(http.Hijacker)
+		clientConn, _, _ := hijacker.Hijack()
+		defer clientConn.Close()
+		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		
+		go io.Copy(targetConn, clientConn)
+		io.Copy(clientConn, targetConn)
 		return
 	}
 
+	log.Printf("[HTTP-%s] Forward: %s via %s", mode, r.URL.Host, proxyAddr)
 	transport := &http.Transport{
 		Dial: dialer.Dial,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns: 100,
+		IdleConnTimeout: 90 * time.Second,
 	}
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
-
 	proxyReq, _ := http.NewRequest(r.Method, r.URL.String(), r.Body)
-	for key, values := range r.Header {
-		for _, value := range values {
-			proxyReq.Header.Add(key, value)
-		}
-	}
-
+	for k, vv := range r.Header { for _, v := range vv { proxyReq.Header.Add(k, v) } }
+	
 	resp, err := client.Do(proxyReq)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), http.StatusBadGateway); return }
 	defer resp.Body.Close()
-
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	for k, vv := range resp.Header { for _, v := range vv { w.Header().Add(k, v) } }
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
 
-func handleHTTPSProxy(w http.ResponseWriter, r *http.Request, dialer proxy.Dialer, proxyAddr string, mode string) {
-	targetConn, err := dialer.Dial("tcp", r.Host)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer targetConn.Close()
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		return
-	}
-	clientConn, _, _ := hijacker.Hijack()
-	defer clientConn.Close()
-
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(targetConn, clientConn) }()
-	go func() { defer wg.Done(); io.Copy(clientConn, targetConn) }()
-	wg.Wait()
-}
-
-func startHTTPServer(pool *ProxyPool, port string, mode string) error {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handleHTTPProxy(w, r, pool, mode)
-	})
-	server := &http.Server{Addr: port, Handler: handler}
-	return server.ListenAndServe()
-}
-
 func main() {
 	cfg, err := loadConfig("config.yaml")
-	if err != nil {
-		log.Fatalf("Config error: %v", err)
-	}
+	if err != nil { log.Fatal(err) }
 	config = *cfg
 
-	strictPool := NewProxyPool()
-	relaxedPool := NewProxyPool()
-	startProxyUpdater(strictPool, relaxedPool, true)
+	sPool, rPool := NewProxyPool(), NewProxyPool()
+	go func() {
+		updateProxyPool(sPool, rPool)
+		ticker := time.NewTicker(time.Duration(config.UpdateIntervalMinutes) * time.Minute)
+		for range ticker.C { updateProxyPool(sPool, rPool) }
+	}()
 
-	var wg sync.WaitGroup
-	wg.Add(4)
-	go func() { defer wg.Done(); startSOCKS5Server(strictPool, config.Ports.SOCKS5Strict, "STRICT") }()
-	go func() { defer wg.Done(); startSOCKS5Server(relaxedPool, config.Ports.SOCKS5Relaxed, "RELAXED") }()
-	go func() { defer wg.Done(); startHTTPServer(strictPool, config.Ports.HTTPStrict, "STRICT") }()
-	go func() { defer wg.Done(); startHTTPServer(relaxedPool, config.Ports.HTTPRelaxed, "RELAXED") }()
+	muxS, muxR := http.NewServeMux(), http.NewServeMux()
+	muxS.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { handleHTTPProxy(w, r, sPool, "STRICT") })
+	muxR.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { handleHTTPProxy(w, r, rPool, "RELAXED") })
 
-	log.Println("Servers started on ports 17283-17286")
-	wg.Wait()
+	log.Printf("Starting servers on %s and %s", config.Ports.HTTPStrict, config.Ports.HTTPRelaxed)
+	go http.ListenAndServe(config.Ports.HTTPStrict, muxS)
+	http.ListenAndServe(config.Ports.HTTPRelaxed, muxR)
 }
