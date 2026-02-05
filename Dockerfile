@@ -3,8 +3,8 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# Install wget to download ip2region database
-RUN apk add --no-cache wget
+# Install build dependencies: git is required for go mod download
+RUN apk add --no-cache git ca-certificates wget
 
 COPY go.mod go.sum ./
 RUN go mod download
