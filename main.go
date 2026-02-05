@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -116,11 +117,22 @@ func (p *ProxyPool) Update(proxies []string) {
 }
 
 func (p *ProxyPool) GetNext() (string, error) {
+	return p.GetBySession("")
+}
+
+func (p *ProxyPool) GetBySession(session string) (string, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	if len(p.proxies) == 0 {
 		return "", fmt.Errorf("no available proxies")
+	}
+
+	if session != "" {
+		h := fnv.New32a()
+		h.Write([]byte(session))
+		idx := uint64(h.Sum32()) % uint64(len(p.proxies))
+		return p.proxies[idx], nil
 	}
 
 	idx := atomic.AddUint64(&p.index, 1) % uint64(len(p.proxies))
@@ -600,14 +612,20 @@ func startSOCKS5Server(pool *ProxyPool, port string, mode string) error {
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, pool *ProxyPool, mode string) {
 	log.Printf("[HTTP-%s] Incoming request: %s %s from %s", mode, r.Method, r.URL.String(), r.RemoteAddr)
 
-	proxyAddr, err := pool.GetNext()
+	// Try to get session from Header
+	session := r.Header.Get("X-Proxy-Session")
+	proxyAddr, err := pool.GetBySession(session)
 	if err != nil {
 		log.Printf("[HTTP-%s] ERROR: No proxy available for %s %s: %v", mode, r.Method, r.URL.String(), err)
 		http.Error(w, "No available proxies", http.StatusServiceUnavailable)
 		return
 	}
 
-	log.Printf("[HTTP-%s] Using proxy %s for %s %s", mode, proxyAddr, r.Method, r.URL.String())
+	if session != "" {
+		log.Printf("[HTTP-%s] Session [%s] -> Using sticky proxy %s", mode, session, proxyAddr)
+	} else {
+		log.Printf("[HTTP-%s] Using proxy %s for %s %s", mode, proxyAddr, r.Method, r.URL.String())
+	}
 
 	// Create SOCKS5 dialer
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
