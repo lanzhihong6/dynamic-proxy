@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"hash/fnv"
@@ -267,23 +268,84 @@ func check(addr string, strict bool) (bool, string) {
 		return false, ""
 	}
 	country := getCountryCode(host)
+
+	// 创建带超时的 context，强制整个检查流程的总时间限制
 	timeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
-	dialer, err := proxy.SOCKS5("tcp", addr, nil, &net.Dialer{Timeout: timeout})
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 使用 context 创建 dialer，确保拨号阶段也受超时控制
+	baseDialer := &net.Dialer{
+		Timeout: timeout,
+	}
+
+	// 创建 SOCKS5 dialer
+	dialer, err := proxy.SOCKS5("tcp", addr, nil, baseDialer)
 	if err != nil {
 		return false, ""
 	}
-	conn, err := dialer.Dial("tcp", "www.google.com:443")
-	if err != nil {
+
+	// 使用带 context 的拨号，确保可以被取消
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	dialCh := make(chan dialResult, 1)
+
+	go func() {
+		conn, err := dialer.Dial("tcp", "www.google.com:443")
+		dialCh <- dialResult{conn: conn, err: err}
+	}()
+
+	var conn net.Conn
+	select {
+	case <-ctx.Done():
+		// 超时或被取消
 		return false, ""
+	case result := <-dialCh:
+		if result.err != nil {
+			return false, ""
+		}
+		conn = result.conn
 	}
 	defer conn.Close()
+
+	// 设置连接的总deadline，确保后续操作也受时间限制
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return false, ""
+	}
+
 	if strict {
-		tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: false, ServerName: "www.google.com"})
-		if err := tlsConn.Handshake(); err != nil {
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: false,
+			ServerName:         "www.google.com",
+		})
+
+		// TLS 握手也需要在 context 控制下
+		type handshakeResult struct {
+			err error
+		}
+		handshakeCh := make(chan handshakeResult, 1)
+
+		go func() {
+			err := tlsConn.Handshake()
+			handshakeCh <- handshakeResult{err: err}
+		}()
+
+		select {
+		case <-ctx.Done():
+			// 超时，强制关闭连接
+			tlsConn.Close()
 			return false, ""
+		case result := <-handshakeCh:
+			if result.err != nil {
+				tlsConn.Close()
+				return false, ""
+			}
 		}
 		tlsConn.Close()
 	}
+
 	return true, country
 }
 
