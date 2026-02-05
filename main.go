@@ -26,12 +26,12 @@ type Config struct {
 	HealthCheckConcurrency     int      `yaml:"health_check_concurrency"`
 	UpdateIntervalMinutes      int      `yaml:"update_interval_minutes"`
 	HealthCheck                struct {
-		TotalTimeoutSeconds           int `yaml:"total_timeout_seconds"`
-		TLSHandshakeThresholdSeconds  int `yaml:"tls_handshake_threshold_seconds"`
+		TotalTimeoutSeconds          int `yaml:"total_timeout_seconds"`
+		TLSHandshakeThresholdSeconds int `yaml:"tls_handshake_threshold_seconds"`
 	} `yaml:"health_check"`
 	Ports struct {
-		HTTPStrict     string `yaml:"http_strict"`
-		HTTPRelaxed    string `yaml:"http_relaxed"`
+		HTTPStrict  string `yaml:"http_strict"`
+		HTTPRelaxed string `yaml:"http_relaxed"`
 	} `yaml:"ports"`
 }
 
@@ -43,15 +43,17 @@ type ProxyInfo struct {
 var (
 	config           Config
 	simpleProxyRegex = regexp.MustCompile(`([0-9a-fA-F:]{3,}|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})`)
-	searcherV4       *xdb.Searcher
-	searcherV6       *xdb.Searcher
+	
+	// Store IP2Region databases as byte buffers in memory for thread-safe access
+	ip2regionV4Buffer []byte
+	ip2regionV6Buffer []byte
 )
 
 type ProxyPool struct {
-	proxies   []ProxyInfo
-	mu        sync.RWMutex
-	index     uint64
-	updating  int32
+	proxies  []ProxyInfo
+	mu       sync.RWMutex
+	index    uint64
+	updating int32
 }
 
 func (p *ProxyPool) Update(proxies []ProxyInfo) {
@@ -113,20 +115,31 @@ func fetchProxyList() []string {
 	return list
 }
 
+// getCountryCode creates a temporary searcher for each lookup to ensure thread safety
 func getCountryCode(ipAddr string) string {
-	var s *xdb.Searcher
+	var buffer []byte
 	if strings.Contains(ipAddr, ":") {
-		s = searcherV6
+		buffer = ip2regionV6Buffer
 	} else {
-		s = searcherV4
+		buffer = ip2regionV4Buffer
 	}
-	if s == nil {
+	
+	if buffer == nil {
 		return "XX"
 	}
-	region, err := s.SearchByStr(ipAddr)
+	
+	// Create a temporary searcher for this query (thread-safe approach)
+	searcher, err := xdb.NewWithBuffer(nil, buffer)
 	if err != nil {
 		return "XX"
 	}
+	defer searcher.Close()
+	
+	region, err := searcher.SearchByStr(ipAddr)
+	if err != nil {
+		return "XX"
+	}
+	
 	parts := strings.Split(region, "|")
 	if len(parts) < 1 {
 		return "XX"
@@ -292,19 +305,36 @@ func main() {
 		config.HealthCheck.TotalTimeoutSeconds = 8
 	}
 
-	// Load ip2region databases with explicit error handling
+	// Load IPv4 database into memory - REQUIRED
+	log.Println("[BOOT] Loading ip2region_v4.xdb...")
 	v4b, err := os.ReadFile("ip2region_v4.xdb")
 	if err != nil {
 		log.Fatalf("[FATAL] Could not read ip2region_v4.xdb: %v", err)
 	}
-	searcherV4, err = xdb.NewWithBuffer(nil, v4b)
+	ip2regionV4Buffer = v4b
+	
+	// Validate V4 database by creating a test searcher
+	testSearcher, err := xdb.NewWithBuffer(nil, ip2regionV4Buffer)
 	if err != nil {
 		log.Fatalf("[FATAL] Could not initialize v4 searcher: %v", err)
 	}
+	testSearcher.Close()
+	log.Println("[BOOT] IPv4 database loaded successfully")
 
+	// Load IPv6 database into memory - OPTIONAL
 	v6b, err := os.ReadFile("ip2region_v6.xdb")
 	if err == nil {
-		searcherV6, _ = xdb.NewWithBuffer(nil, v6b)
+		ip2regionV6Buffer = v6b
+		testSearcherV6, err := xdb.NewWithBuffer(nil, ip2regionV6Buffer)
+		if err == nil {
+			testSearcherV6.Close()
+			log.Println("[BOOT] IPv6 database loaded successfully")
+		} else {
+			log.Printf("[WARN] IPv6 database file found but invalid: %v", err)
+			ip2regionV6Buffer = nil
+		}
+	} else {
+		log.Printf("[WARN] IPv6 database not found (optional): %v", err)
 	}
 
 	sp, rp := &ProxyPool{}, &ProxyPool{}
