@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/armon/go-socks5"
 	"golang.org/x/net/proxy"
 	"gopkg.in/yaml.v3"
 )
