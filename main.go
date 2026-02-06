@@ -86,13 +86,27 @@ func (p *ProxyPool) GetNext(session, country string) (string, error) {
 	}
 	var cands []ProxyInfo
 	if country != "" {
+		isExclude := strings.HasPrefix(country, "!")
+		targets := strings.Split(strings.TrimPrefix(country, "!"), ",")
+		for i := range targets {
+			targets[i] = strings.TrimSpace(targets[i])
+		}
+
 		for _, pr := range p.proxies {
-			if strings.EqualFold(pr.Country, country) {
+			match := false
+			for _, t := range targets {
+				if strings.EqualFold(pr.Country, t) {
+					match = true
+					break
+				}
+			}
+			if (isExclude && !match) || (!isExclude && match) {
 				cands = append(cands, pr)
 			}
 		}
+		// Fallback: If no proxies match after filtering, use all
 		if len(cands) == 0 {
-			return "", fmt.Errorf("no proxies in %s", country)
+			cands = p.proxies
 		}
 	} else {
 		cands = p.proxies
