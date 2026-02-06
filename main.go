@@ -128,25 +128,39 @@ func (p *ProxyPool) GetTotalCount() int {
 }
 
 func fetchProxyList() []string {
-	client := &http.Client{Timeout: 15 * time.Second}
+	// Parallel fetch with 10s timeout per source
+	client := &http.Client{Timeout: 10 * time.Second}
 	var list []string
+	var mu sync.Mutex
 	set := make(map[string]bool)
 	urls := append(config.ProxyListURLs, config.SpecialProxyListUrls...)
+
+	var wg sync.WaitGroup
 	for _, url := range urls {
-		resp, err := client.Get(url)
-		if err != nil {
-			continue
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		matches := simpleProxyRegex.FindAllString(string(b), -1)
-		for _, m := range matches {
-			if !set[m] {
-				set[m] = true
-				list = append(list, m)
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			resp, err := client.Get(u)
+			if err != nil {
+				return
 			}
-		}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			
+			matches := simpleProxyRegex.FindAllString(string(b), -1)
+			if len(matches) > 0 {
+				mu.Lock()
+				for _, m := range matches {
+					if !set[m] {
+						set[m] = true
+						list = append(list, m)
+					}
+				}
+				mu.Unlock()
+			}
+		}(url)
 	}
+	wg.Wait()
 	return list
 }
 
@@ -338,9 +352,11 @@ func check(addr string, strict bool) (bool, string) {
 	}
 	defer conn.Close()
 
-	// 设置连接的总deadline，确保后续操作也受时间限制
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return false, ""
+	// Use context deadline for precision - do not reset the clock
+	if d, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(d)
+	} else {
+		conn.SetDeadline(time.Now().Add(timeout))
 	}
 
 	if strict {
@@ -560,6 +576,18 @@ func handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 func handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if update is already running to prevent stacking
+	strictUpdating := atomic.LoadInt32(&strictPool.updating) == 1
+	relaxedUpdating := atomic.LoadInt32(&relaxedPool.updating) == 1
+	if strictUpdating || relaxedUpdating {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ignored",
+			"message": "Update already in progress",
+		})
 		return
 	}
 
